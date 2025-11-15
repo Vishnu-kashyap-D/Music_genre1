@@ -17,6 +17,24 @@ but the parallel CNN flow described below is the recommended path.
 
 ---
 
+## 0. Get the Code
+
+```powershell
+# grab the repository
+git clone https://github.com/Vishnu-kashyap-D/Music_Genre_Classification.git
+cd Music_Genre_Classification
+
+# (optional) create an isolated environment right away
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+> **Note:** Model checkpoints (`*.pt`, `*.joblib`, `genre_classifier.keras`) and raw datasets are
+ignored by Git. If you want to reuse a trained model, copy the checkpoint into `torch_models/`
+after cloning (or download it from the release you share).
+
+---
+
 ## 1. Environment Setup
 
 ```powershell

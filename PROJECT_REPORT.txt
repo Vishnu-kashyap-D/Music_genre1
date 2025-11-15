@@ -1,0 +1,211 @@
+============================================================
+MUSIC GENRE CLASSIFICATION USING PARALLEL CNN + OPENL3
+============================================================
+
+Author / Maintainer : Vishnu-kashyap-D
+Repository         : https://github.com/Vishnu-kashyap-D/Music_Genre_Classification
+
+------------------------------------------------------------
+1. EXECUTIVE SUMMARY
+------------------------------------------------------------
+The project delivers a multi-label music-genre classifier capable of analysing arbitrary audio
+tracks, slicing them into fixed temporal windows, and predicting one or more genres per track. The
+core innovation is a Parallel Convolutional Neural Network (PCNN) that processes mel-spectrogram
+slices alongside optional OpenL3 embeddings, fusing their representations through attention pooling
+and residual/SE-enhanced convolutional blocks. The system supports GPU-accelerated training and
+inference, advanced augmentation (SpecAugment), and flexible evaluation tooling for both GTZAN and
+custom datasets.
+
+------------------------------------------------------------
+2. OBJECTIVES
+------------------------------------------------------------
+- Build a high-accuracy multi-label genre classifier that outperforms baseline single-branch CNNs.
+- Support extensible feature backbones by combining handcrafted mel features with learned
+  OpenL3 embeddings in a parallel architecture.
+- Ensure reproducible training/evaluation with deterministic seeding, caching, and CLI tooling.
+- Provide modular inference scripts (single file, batch CSV) with fine-grained clip controls.
+- Document a deployable workflow so other researchers can clone, train, evaluate, and extend the
+  model with minimal friction.
+
+------------------------------------------------------------
+3. DOMAIN & USE CASES
+------------------------------------------------------------
+Domain            : Music Information Retrieval (MIR), Intelligent Audio Analysis.
+Primary Use Cases :
+    • Auto-tagging music libraries with multi-genre labels.
+    • Pre-filtering datasets for recommendation or playlist generation.
+    • Analysing short-form audio clips (e.g., social media, jingles) for genre traits.
+    • Research experimentation with alternative embeddings or attention mechanisms.
+
+------------------------------------------------------------
+4. APPROACH OVERVIEW
+------------------------------------------------------------
+1. Data ingestion: load WAV/MP3, resample to 22.05 kHz, slice into 15-second windows consisting of
+   three 5-second sub-slices (configurable).
+2. Feature stack:
+   • Branch A: mel-spectrograms (n_fft=2048, hop=512, n_mels=128) processed slice-wise.
+   • Branch B: OpenL3 embeddings (512-dim, music content_type) extracted per 5-second slice.
+3. Parallel CNN (PCNN): residual conv blocks with squeeze-excitation (SE) gating, dropout, and
+   shared or separate backbones per branch. Outputs merged via attention pooling.
+4. Classification head: fully connected projections + sigmoid activations for nine GTZAN genres.
+5. Training objective: Binary Cross-Entropy with logits for multi-label outputs; mixed-precision
+   training on CUDA when available.
+6. Evaluation: per-window predictions aggregated (mean) to produce track-level probabilities; top-3
+   reporting and thresholded label selection.
+
+------------------------------------------------------------
+5. SYSTEM ARCHITECTURE
+------------------------------------------------------------
+Layers / Components:
+    • Input Stage: Librosa loaders + deterministic slicing utilities.
+    • Feature Extraction:
+        - Mel Spectrogram Pipeline (mel branch) with SpecAugment support.
+        - OpenL3 Feature Pipeline (embedding branch) with caching of embeddings per file.
+    • Parallel Convolutional Blocks:
+        - Residual CNN stacks with SE modules and dropout.
+        - Optional shared backbone for reduced parameters.
+    • Attention Pooling:
+        - Multi-head self-attention to weigh slices; concatenated with global pooling results.
+    • Classification Head:
+        - Fully connected layers, ReLU, dropout, sigmoid outputs (multi-label).
+    • Inference Interface:
+        - `evaluate_parallel_model.py`: CLI for single audio file with clip controls.
+        - `evaluate_custom_parallel.py`: CSV-driven batch evaluation (supports multi-label ground
+          truth using `|` separated tags).
+
+------------------------------------------------------------
+6. DATA FLOW DESCRIPTION
+------------------------------------------------------------
+    Raw Audio (MP3/WAV)
+        ↓ librosa.load (22.05 kHz, mono)
+    Time Windowing (15s windows; stride 5s)
+        ↓
+    Slice Extraction (3 × 5s per window)
+        ↓                   ↓
+    Mel Spectrograms      OpenL3 Embeddings
+        ↓                   ↓
+    Parallel CNN Branches (residual + SE)
+        ↓ concat via attention pooling
+    Dense layers + Sigmoid outputs
+        ↓
+    Genre Probabilities (multi-label)
+        ↓
+    Threshold / Top-3 summarisation (console, CSV, logs)
+
+------------------------------------------------------------
+7. SYSTEM REQUIREMENTS
+------------------------------------------------------------
+Hardware:
+    • NVIDIA GPU with CUDA capability (Ampere or newer recommended) OR CPU fallback.
+    • 16 GB RAM minimum for smooth OpenL3 embedding generation.
+    • ~5 GB disk for GTZAN dataset plus caches.
+Software:
+    • Windows 10/11 (PowerShell), or any OS with Python 3.10+.
+    • Python 3.10 (virtualenv recommended).
+    • Dependencies from `requirements.txt` (PyTorch CUDA 12.4 wheels, TensorFlow, librosa, OpenL3,
+      scikit-learn, etc.).
+    • Git for version control.
+
+------------------------------------------------------------
+8. PROGRAMMING LANGUAGES & KEY LIBRARIES
+------------------------------------------------------------
+Languages : Python 3.10+
+Primary Libraries:
+    • PyTorch (torch, torch.nn, torch.utils.data)
+    • Librosa (audio loading, mel features)
+    • OpenL3 (pretrained audio embeddings)
+    • NumPy, scikit-learn (metrics), pandas (optional for CSV manipulation)
+    • TensorFlow (dependency of OpenL3)
+    • GPU utilities: CUDA via torch, optional TensorFlow GPU.
+
+------------------------------------------------------------
+9. DETAILED MODULE DESCRIPTIONS
+------------------------------------------------------------
+- `train_parallel_cnn.py`: definition of DatasetConfig, OpenL3Config, ParallelCNN architecture,
+  training loop, logging, checkpoint serialization (state_dict + metadata + mapping).
+- `evaluate_parallel_model.py`: loads checkpoint metadata, reconstructs OpenL3 models on demand,
+  creates windows for inference with `--clip-start`, `--clip-duration`, `--max-windows` flags, and
+  prints per-track multi-label predictions.
+- `evaluate_custom_parallel.py`: resolves file paths, parses multi-label CSV entries, thresholds
+  predictions, and outputs overall/per-genre accuracy (extendable to precision/recall/F1).
+- Legacy scripts: `train_model_torch.py`, `predict_genre_torch.py`, `train_model.py`,
+  `predict_genre.py` retained for historical baselines.
+
+------------------------------------------------------------
+10. ALGORITHMIC HIGHLIGHTS
+------------------------------------------------------------
+• Window Computation Algorithm:
+    - Sliding stride in samples = `window_stride * sample_rate`.
+    - Ensures coverage of final window even if not divisible by stride.
+    - Handles short clips by padding to `window_samples` with `librosa.util.fix_length`.
+• SpecAugment on mel slices (optional) applies frequency/time masking for robustness.
+• Attention Pooling:
+    - Multi-head attention summarises per-slice features before concatenation.
+    - Provides interpretability by indicating slice importance.
+• Multi-label Inference:
+    - Sigmoid outputs aggregated across windows; threshold 0.5 plus fallback to top-1.
+    - Future improvements: dynamic thresholds per genre, calibration.
+
+------------------------------------------------------------
+11. SYSTEM DESIGN & ARCHITECTURE DIAGRAM (TEXTUAL)
+------------------------------------------------------------
+[Client CLI] -> [Audio Loader & Preprocessor] -> [Feature Extractors]
+    -> [Parallel CNN Backbone] -> [Attention Pooling] -> [Classifier]
+    -> [Prediction Output]
+
+Supporting components:
+    • Cache Manager: stores OpenL3 embeddings in `torch_cache/parallel` (configurable).
+    • Checkpoint Store: `torch_models/*.pt` with metadata for inference scripts.
+
+------------------------------------------------------------
+12. TESTING & VALIDATION
+------------------------------------------------------------
+Testing Phases:
+    1. Unit-level smoke tests for dataset windowing (`compute_windows_for_track`) via short audio
+       clips checked into `tmp_*.wav`.
+    2. Integration tests: run `python evaluate_parallel_model.py <sample>` verifying top-3 output.
+    3. Custom dataset evaluation: `evaluate_custom_parallel.py Data/custom_eval.csv --root <dir>`
+       ensures multi-label parsing & missing-file messaging.
+    4. GPU/CPU parity checks: same input processed on CPU vs GPU to verify determinism/matching
+       thresholds within tolerance.
+Validation Metrics:
+    - Overall accuracy (custom CSV + GTZAN hold-outs).
+    - Per-genre accuracy logs for imbalanced datasets.
+    - TODO: extend script to compute precision, recall, F1 (macro & micro) for publishing.
+Test Cases (representative):
+    • Short (<5s) audio clip -> ensures padding path handles small segments.
+    • Multi-genre labels -> ensures `pred ∩ ground-truth` evaluation logic works.
+    • Missing files -> script warns and continues without crashing.
+
+------------------------------------------------------------
+13. DEPLOYMENT & EXECUTION WORKFLOW
+------------------------------------------------------------
+1. Clone repo & create virtualenv (see Section 0).
+2. Install requirements via `pip install -r requirements.txt`.
+3. Acquire dataset (GTZAN or custom) and optional checkpoints.
+4. Train model: `python train_parallel_cnn.py --feature-type openl3 ...`.
+5. Run single-file inference: `python evaluate_parallel_model.py <audio> [clip flags]`.
+6. Evaluate custom CSV: `python evaluate_custom_parallel.py Data/custom_eval.csv --root <dir>`.
+7. Commit and push changes (README now documents Git workflow for reproducibility).
+
+------------------------------------------------------------
+14. FUTURE WORK & ENHANCEMENTS
+------------------------------------------------------------
+- Add automatic precision/recall/F1 computation and confusion matrices for custom evaluations.
+- Export TorchScript / ONNX models for mobile/edge deployment.
+- UI dashboard (Streamlit/Gradio) for drag-and-drop inference.
+- Experiment with transformer-based audio embeddings (e.g., AST or CLAP) as additional branches.
+- Provide Dockerfile/compose for containerised deployments.
+
+------------------------------------------------------------
+15. REFERENCES & RESOURCES
+------------------------------------------------------------
+- GTZAN Dataset: http://marsyas.info/downloads/datasets.html
+- OpenL3 Embeddings: https://github.com/marl/openl3
+- SpecAugment: Park et al., "SpecAugment: A Simple Data Augmentation Method for Automatic Speech
+  Recognition." Interspeech 2019.
+- Attention Pooling inspiration: Jetley et al., "Learn to Pay Attention" (ICLR 2018).
+
+------------------------------------------------------------
+END OF DOCUMENT
+------------------------------------------------------------
