@@ -17,7 +17,113 @@ but the parallel CNN flow described below is the recommended path.
 
 ---
 
-## 0. Get the Code
+## 🚀 Quick Start - Clone and Run on Any System
+
+### Prerequisites
+- **Python 3.11+** (Python 3.10 recommended for full OpenL3 support)
+- **Node.js 16+** and npm
+- **Git**
+- **NVIDIA GPU** (optional, but recommended for faster processing)
+- **CUDA 12.4+** drivers (if using GPU)
+
+### Step 1: Clone the Repository (pro1 branch)
+
+```powershell
+# Clone the pro1 branch (deployment-ready with pre-trained model)
+git clone -b pro1 https://github.com/Vishnu-kashyap-D/Music_Genre_Classification.git
+cd Music_Genre_Classification
+```
+
+### Step 2: Setup Python Backend
+
+```powershell
+# Create virtual environment
+python -m venv .venv
+
+# Activate virtual environment
+# Windows PowerShell:
+.\.venv\Scripts\Activate.ps1
+# Windows CMD:
+.\.venv\Scripts\activate.bat
+
+# Install Python dependencies (includes PyTorch with CUDA support)
+pip install -r requirements.txt
+```
+
+### Step 3: Setup React Frontend
+
+```powershell
+# Open a new terminal and navigate to frontend directory
+cd frontend
+
+# Install Node.js dependencies
+npm install
+```
+
+### Step 4: Run the Application
+
+**Terminal 1 - Start Backend Server:**
+```powershell
+# From project root directory
+.\.venv\Scripts\Activate.ps1
+python app.py
+```
+✅ Backend will run on `http://127.0.0.1:5000`
+
+**Terminal 2 - Start Frontend Server:**
+```powershell
+# From project root directory
+cd frontend
+npm run dev
+```
+✅ Frontend will run on `http://localhost:3000`
+
+### Step 5: Access the Application
+
+Open your browser and go to: **http://localhost:3000**
+
+### 🎵 What's Included Out of the Box
+
+- ✅ **Pre-trained Model**: `torch_models/parallel_genre_classifier_torch.pt` (56MB, 10 genres)
+- ✅ **Complete Backend**: Flask API with CUDA/CPU support
+- ✅ **Full Frontend**: React app with authentication, analysis, history tracking
+- ✅ **No Training Needed**: Model is ready to classify audio immediately
+
+### 📊 Supported Genres
+
+The pre-trained model classifies 10 genres:
+- Blues, Classical, Country, Disco, Hip-Hop, Jazz, Metal, Pop, Reggae, Rock
+
+### 🔧 Troubleshooting
+
+**Port Already in Use:**
+```powershell
+# Kill process on port 5000 (backend)
+Get-Process -Id (Get-NetTCPConnection -LocalPort 5000).OwningProcess | Stop-Process -Force
+
+# Kill process on port 3000 (frontend)
+Get-Process -Id (Get-NetTCPConnection -LocalPort 3000).OwningProcess | Stop-Process -Force
+```
+
+**Python Module Not Found:**
+```powershell
+# Ensure virtual environment is activated
+.\.venv\Scripts\Activate.ps1
+# Reinstall dependencies
+pip install -r requirements.txt
+```
+
+**Frontend Build Errors:**
+```powershell
+# Clear npm cache and reinstall
+cd frontend
+rm -r node_modules
+npm install
+```
+
+---
+
+## 0. Get the Code (Advanced)
 
 ```powershell
 # grab the repository
@@ -172,7 +278,64 @@ Potential follow-ups:
 
 ---
 
-## 8. Quick Reference Commands
+## 8. Running the Web Application
+
+### Backend (Flask API)
+
+**Using Python 3.10 environment (recommended for OpenL3 support):**
+```powershell
+# Activate conda environment
+conda activate music_genre
+
+# Or if using venv
+.\.venv\Scripts\Activate.ps1
+
+# Start Flask server
+python app.py
+```
+
+**Or using Python 3.12 (mel features only):**
+```powershell
+python app.py
+```
+
+Backend runs on `http://localhost:5000`
+
+### Frontend (React App)
+
+**In a new terminal:**
+```powershell
+# Navigate to frontend directory
+cd frontend
+
+# Install dependencies (first time only)
+npm install
+
+# Start development server
+npm run dev
+```
+
+Frontend runs on `http://localhost:3000`
+
+### Quick Start (Both Services)
+
+**Terminal 1 - Backend:**
+```powershell
+conda activate music_genre
+python app.py
+```
+
+**Terminal 2 - Frontend:**
+```powershell
+cd frontend
+npm run dev
+```
+
+Then open `http://localhost:3000` in your browser.
+
+---
+
+## 9. Quick Reference Commands
 
 ```powershell
 # train parallel CNN with mel features only
@@ -186,3 +349,4 @@ python evaluate_custom_parallel.py Data/custom_eval.csv --root "C:\test_set"
 ```
 
 Feel free to open issues or PRs if you explore different datasets or add new downstream tasks!
+>>>>>>> Stashed changes

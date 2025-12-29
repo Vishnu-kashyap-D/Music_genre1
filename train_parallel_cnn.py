@@ -20,9 +20,12 @@ from train_model_torch import choose_device, set_seed
 librosa_utils = importlib.import_module("librosa.util.utils")
 
 try:  # optional dependency for OpenL3 embeddings
-    import openl3
-except ImportError:  # pragma: no cover - handled at runtime when feature enabled
-    openl3 = None
+    import torchopenl3 as openl3
+except ImportError:  # pragma: no cover
+    try:
+        import openl3
+    except ImportError:
+        openl3 = None
 
 DEFAULT_DATASET_PATH = os.path.join("Data", "genres_original")
 DEFAULT_SAVE_PATH = os.path.join("torch_models", "parallel_genre_classifier_torch.pt")
@@ -177,9 +180,13 @@ def _compute_openl3_slices(
             batch_size=l3_config.batch_size,
             model=l3_model,
         )
+        if hasattr(embeddings, "cpu"):
+            embeddings = embeddings.cpu().numpy()
         if embeddings.size == 0:
             return None
-        slice_emb = embeddings.mean(axis=0).astype(np.float32, copy=False)
+        # embeddings shape is (1, Time, Dim)
+        # We want to average over Time to get (Dim,) for the slice
+        slice_emb = embeddings[0].mean(axis=0).astype(np.float32, copy=False)
         slices.append(slice_emb)
 
     return np.stack(slices, axis=0)
@@ -243,7 +250,7 @@ def build_split_features(
     feature_type: str,
     l3_config: Optional[OpenL3Config],
     l3_model,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     aggregate_cache = None
     track_cache_dir = None
     if cache_dir:
@@ -260,16 +267,22 @@ def build_split_features(
 
     if aggregate_cache and os.path.exists(aggregate_cache):
         data = np.load(aggregate_cache)
-        return data["X"], data["y"]
+        if "track_ids" in data:
+            return data["X"], data["y"], data["track_ids"]
+        # Compatibility fallback if cache doesn't have track_ids, though we recommend clearing cache
+        print(f"Warning: Cache {aggregate_cache} missing track_ids. Aggregation will be skipped.")
+        return data["X"], data["y"], np.zeros(len(data["y"]), dtype=np.int64)
 
     features: List[np.ndarray] = []
     labels: List[int] = []
+    track_ids: List[int] = []  # New: Store unique ID for each track
     processed = 0
     total_tracks = len(tracks)
     interrupted = False
 
     try:
-        for file_path, label in tracks:
+        # Enumerate to get unique track ID
+        for t_idx, (file_path, label) in enumerate(tracks):
             cache_file = None
             if track_cache_dir:
                 cache_file = os.path.join(track_cache_dir, _track_cache_name(file_path))
@@ -288,6 +301,7 @@ def build_split_features(
 
             features.extend(windows)
             labels.extend([label] * len(windows))
+            track_ids.extend([t_idx] * len(windows))  # Assign same ID to all clips from this song
             processed += 1
             if processed % 10 == 0 or processed == total_tracks:
                 print(f"Processed {processed}/{total_tracks} tracks for '{split_name}' split")
@@ -299,9 +313,10 @@ def build_split_features(
 
     X = np.stack(features).astype(np.float32)
     y = np.array(labels, dtype=np.int64)
+    t_ids = np.array(track_ids, dtype=np.int64)
 
     if aggregate_cache and not interrupted:
-        np.savez_compressed(aggregate_cache, X=X, y=y)
+        np.savez_compressed(aggregate_cache, X=X, y=y, track_ids=t_ids)
 
     if interrupted:
         print(
@@ -310,7 +325,7 @@ def build_split_features(
         )
         raise KeyboardInterrupt
 
-    return X, y
+    return X, y, t_ids
 
 
 class SqueezeExcitation(nn.Module):
@@ -493,30 +508,84 @@ class ParallelCNN(nn.Module):
         return self.head(fused)
 
 
-def apply_parallel_augment(batch: torch.Tensor) -> torch.Tensor:
-    augmented = batch + 0.012 * torch.randn_like(batch)
-    gain = 1.0 + 0.08 * (torch.rand(batch.size(0), batch.size(1), 1, 1, 1, device=batch.device) - 0.5)
-    augmented = augmented * gain
+def apply_music_augment(batch: torch.Tensor) -> torch.Tensor:
+    """
+    Music-Aware Data Augmentation for pre-calculated Mel-spectrograms.
+    Only applies Time-Stretch and Pitch-Shift using tensor operations.
+    """
+    # Clone to avoid inplace modification of original batch
+    aug = batch.clone()
+    
+    # SAFETY CHECK: If input is OpenL3 embeddings (3D: Batch, Slices, Dim), 
+    # we cannot apply Spectrogram Augmentations (Time Stretch/Pitch Shift).
+    # Return unchanged or apply Simple Dropout/Noise if desired.
+    if aug.ndim == 3:
+        # OpenL3 case: [Batch, Slices, EmbDim]
+        # We cannot pitch-shift/time-stretch embeddings.
+        return aug
 
-    max_time_mask = 24
-    max_freq_mask = 18
-    for slice_idx in range(batch.size(1)):
-        slice_tensor = augmented[:, slice_idx]
-        time_width = torch.randint(0, max_time_mask + 1, (batch.size(0),), device=batch.device)
-        freq_width = torch.randint(0, max_freq_mask + 1, (batch.size(0),), device=batch.device)
-        for b in range(batch.size(0)):
-            if time_width[b] > 0:
-                start = torch.randint(0, slice_tensor.size(-1) - time_width[b] + 1, (1,), device=batch.device).item()
-                slice_tensor[b, :, :, start : start + time_width[b]] = slice_tensor[b, :, :, start : start + time_width[b]].min()
-            if freq_width[b] > 0:
-                start = torch.randint(0, slice_tensor.size(-2) - freq_width[b] + 1, (1,), device=batch.device).item()
-                block = slice_tensor[b, :, start : start + freq_width[b], :]
-                slice_tensor[b, :, start : start + freq_width[b], :] = block.mean()
-    shift = torch.randint(-12, 13, (batch.size(0),), device=batch.device)
-    for b in range(batch.size(0)):
-        if shift[b] != 0:
-            augmented[b] = torch.roll(augmented[b], shifts=int(shift[b].item()), dims=-1)
-    return torch.clamp(augmented, min=-80.0, max=0.0)
+    # 1. Time-Stretch (via Interpolation)
+    # Range: +/- 5% (0.95 to 1.05)
+    stretch_factor = 0.95 + (0.1 * torch.rand(1, device=batch.device).item())
+    
+    # Handle 4D (B, S, F, T) and 5D (B, S, C, F, T)
+    if aug.ndim == 4:
+        B, S, Freq, Time = aug.shape
+        C = 1
+        reshaped = aug.view(B * S, C, Freq, Time)
+    elif aug.ndim == 5:
+        B, S, C, Freq, Time = aug.shape
+        reshaped = aug.view(B * S, C, Freq, Time)
+    else:
+        # Unexpected shape
+        return aug
+    
+    new_time = int(Time * stretch_factor)
+    stretched = F.interpolate(reshaped, size=(Freq, new_time), mode='bilinear', align_corners=False)
+    
+    # Crop or Pad back to original Time
+    if new_time > Time:
+        # Crop center
+        start = (new_time - Time) // 2
+        stretched = stretched[:, :, :, start : start + Time]
+    elif new_time < Time:
+        # Pad with zeros (or reflection)
+        pad_total = Time - new_time
+        pad_l = pad_total // 2
+        pad_r = pad_total - pad_l
+        stretched = F.pad(stretched, (pad_l, pad_r))
+        
+    if aug.ndim == 4:
+        aug = stretched.view(B, S, Freq, Time)
+    else:
+        aug = stretched.view(B, S, C, Freq, Time)
+
+    # 2. Pitch-Shift (via Roll along frequency axis)
+    # Range: +/- 1 semitone. 1 semitone in 128-bin Mel (~22k) roughly corresponds to 1-2 bins?
+    # Actually, a semitone shift is discrete in Mel bins. 
+    # For standard Mel scale, bins are roughly perceptually spaced. We'll shift +/- 2 bins.
+    
+    # Random integer shift between -2 and 2 (inclusive)
+    shift_bins = torch.randint(-2, 3, (B,), device=batch.device)
+    
+    for b in range(B):
+        s = shift_bins[b].item()
+        if s != 0:
+            # Shift frequency axis (dim -2)
+            aug[b] = torch.roll(aug[b], shifts=int(s), dims=-2)
+            # Zero out rolled-around parts to avoid artifacts
+            if s > 0:
+                if aug.ndim == 4:
+                    aug[b, :, :s, :] = -80.0
+                else:
+                    aug[b, :, :, :s, :] = -80.0
+            else:
+                if aug.ndim == 4:
+                    aug[b, :, s:, :] = -80.0
+                else:
+                    aug[b, :, :, s:, :] = -80.0
+                
+    return aug
 
 
 def train_epoch(
@@ -533,11 +602,15 @@ def train_epoch(
     running_loss = 0.0
     correct = 0
     total = 0
-    for inputs, targets in loader:
+    for batch in loader:
+        if len(batch) == 3:
+            inputs, targets, _ = batch
+        else:
+            inputs, targets = batch
         inputs = inputs.to(device)
         targets = targets.to(device).float()
         if augment:
-            inputs = apply_parallel_augment(inputs)
+            inputs = apply_music_augment(inputs)
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=use_mixed_precision, dtype=torch.float16):
             outputs = model(inputs)
@@ -555,15 +628,34 @@ def train_epoch(
     return running_loss / total, correct / total
 
 
-def evaluate(model: nn.Module, device: torch.device, loader: DataLoader, criterion: nn.Module) -> Tuple[float, float]:
+def evaluate(
+    model: nn.Module, 
+    device: torch.device, 
+    loader: DataLoader, 
+    criterion: nn.Module
+) -> Tuple[float, float, float]:
     model.eval()
     loss_accum = 0.0
     correct = 0
     total = 0
+    
+    # Containers for Song-Level Aggregation
+    all_probs = []
+    all_targets = []
+    all_track_ids = []
+
     with torch.inference_mode():
-        for inputs, targets in loader:
+        for batch in loader:
+            # Handle unpacked batch depending on if track_ids are present
+            if len(batch) == 3:
+                inputs, targets, track_ids = batch
+            else:
+                inputs, targets = batch
+                track_ids = torch.zeros(targets.size(0), dtype=torch.long) # Dummy if missing
+
             inputs = inputs.to(device)
             targets = targets.to(device).float()
+            
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss_accum += loss.item() * inputs.size(0)
@@ -573,7 +665,49 @@ def evaluate(model: nn.Module, device: torch.device, loader: DataLoader, criteri
             match = (preds & (targets.bool())).any(dim=1).sum().item()
             correct += match
             total += targets.size(0)
-    return loss_accum / total, correct / total
+            
+            # Collect for aggregation
+            all_probs.append(probs.cpu())
+            all_targets.append(targets.cpu())
+            all_track_ids.append(track_ids)
+
+    # Calculate Clip-Level Accuracy
+    clip_acc = correct / total
+    
+    # Calculate Song-Level Aggregation Accuracy
+    full_probs = torch.cat(all_probs)
+    full_targets = torch.cat(all_targets)
+    full_track_ids = torch.cat(all_track_ids)
+    
+    unique_tracks = torch.unique(full_track_ids)
+    song_correct = 0
+    song_total = 0
+    
+    for t_id in unique_tracks:
+        # Find all clips for this track
+        mask = (full_track_ids == t_id)
+        if not mask.any(): continue
+        
+        track_probs = full_probs[mask]  # (N_clips, classes)
+        track_target = full_targets[mask][0] # All clips share same target
+        
+        # Mean aggregation
+        avg_prob = track_probs.mean(dim=0) # (classes,)
+        
+        # Prediction (Multi-label or Single-label logic?)
+        # User requested: Final song label = argmax(mean_probs) -> Implies Single Label Evaluation for Song
+        # But ground truth is one-hot.
+        
+        pred_label = avg_prob.argmax().item()
+        true_label = track_target.argmax().item()
+        
+        if pred_label == true_label:
+            song_correct += 1
+        song_total += 1
+        
+    song_acc = song_correct / song_total if song_total > 0 else 0.0
+
+    return loss_accum / total, clip_acc, song_acc
 
 
 def fine_tune_model(
@@ -611,12 +745,12 @@ def fine_tune_model(
             use_mixed_precision,
             augment,
         )
-        val_loss, val_acc = evaluate(model, device, val_loader, criterion)
+        val_loss, val_acc, val_song_acc = evaluate(model, device, val_loader, criterion)
 
         print(
             f"FineTune Epoch {epoch:03d}/{epochs} | "
             f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:5.2f}% | "
-            f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:5.2f}%"
+            f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:5.2f}% | Song Acc: {val_song_acc*100:5.2f}%"
         )
 
         improved = val_loss + 1e-4 < best_val_loss
@@ -680,9 +814,9 @@ def create_dataloaders(
         if openl3 is None:
             raise RuntimeError("openl3 package is required for feature_type 'openl3' but is not installed")
         l3_model = load_openl3_model(l3_config)
-    X_train, y_train = build_split_features(train_tracks, cfg, cache_dir, "train", feature_type, l3_config, l3_model)
-    X_val, y_val = build_split_features(val_tracks, cfg, cache_dir, "val", feature_type, l3_config, l3_model)
-    X_test, y_test = build_split_features(test_tracks, cfg, cache_dir, "test", feature_type, l3_config, l3_model)
+    X_train, y_train, t_ids_train = build_split_features(train_tracks, cfg, cache_dir, "train", feature_type, l3_config, l3_model)
+    X_val, y_val, t_ids_val = build_split_features(val_tracks, cfg, cache_dir, "val", feature_type, l3_config, l3_model)
+    X_test, y_test, t_ids_test = build_split_features(test_tracks, cfg, cache_dir, "test", feature_type, l3_config, l3_model)
 
     num_classes = len(mapping)
     def to_onehot(y_arr: np.ndarray) -> np.ndarray:
@@ -694,11 +828,31 @@ def create_dataloaders(
     y_val_oh = to_onehot(y_val)
     y_test_oh = to_onehot(y_test)
 
-    return (X_train, y_train_oh), (X_val, y_val_oh), (X_test, y_test_oh), mapping
+    return (X_train, y_train_oh, t_ids_train), (X_val, y_val_oh, t_ids_val), (X_test, y_test_oh, t_ids_test), mapping
 
 
-def to_dataloader(features: np.ndarray, labels: np.ndarray, batch_size: int, shuffle: bool) -> DataLoader:
-    tensors = TensorDataset(torch.from_numpy(features), torch.from_numpy(labels))
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+        self.alpha = alpha
+
+    def forward(self, inputs, targets):
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        pt = torch.exp(-bce_loss)
+        focal_loss = (1 - pt) ** self.gamma * bce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+def to_dataloader(features: np.ndarray, labels: np.ndarray, track_ids: np.ndarray, batch_size: int, shuffle: bool) -> DataLoader:
+    tensors = TensorDataset(torch.from_numpy(features), torch.from_numpy(labels), torch.from_numpy(track_ids))
     return DataLoader(tensors, batch_size=batch_size, shuffle=shuffle, num_workers=0)
 
 
@@ -733,6 +887,8 @@ def main() -> None:
     parser.add_argument("--fine-tune-weight-decay", type=float, default=1e-5, help="Weight decay during fine-tuning")
     parser.add_argument("--fine-tune-patience", type=int, default=3, help="Early stopping patience for fine-tuning")
     parser.add_argument("--fine-tune-augment", action="store_true", help="Apply augmentation while fine-tuning")
+    parser.add_argument("--loss-type", choices=("ce", "focal"), default="ce", help="Loss function type (ce or focal)")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -765,7 +921,7 @@ def main() -> None:
             args.fine_tune_augment = False
 
     cache_dir = args.cache_dir if args.cache_dir else None
-    (X_train, y_train), (X_val, y_val), (X_test, y_test), mapping = create_dataloaders(
+    (X_train, y_train, t_ids_train), (X_val, y_val, t_ids_val), (X_test, y_test, t_ids_test), mapping = create_dataloaders(
         args.dataset_path,
         cfg,
         cache_dir,
@@ -780,9 +936,9 @@ def main() -> None:
         f"train samples: {X_train.shape[0]}, val: {X_val.shape[0]}, test: {X_test.shape[0]}"
     )
 
-    train_loader = to_dataloader(X_train, y_train, args.batch_size, shuffle=True)
-    val_loader = to_dataloader(X_val, y_val, args.batch_size, shuffle=False)
-    test_loader = to_dataloader(X_test, y_test, args.batch_size, shuffle=False)
+    train_loader = to_dataloader(X_train, y_train, t_ids_train, args.batch_size, shuffle=True)
+    val_loader = to_dataloader(X_val, y_val, t_ids_val, args.batch_size, shuffle=False)
+    test_loader = to_dataloader(X_test, y_test, t_ids_test, args.batch_size, shuffle=False)
 
     input_feature_dim: Optional[int] = None
     if feature_type == "openl3":
@@ -803,10 +959,24 @@ def main() -> None:
         feature_type=feature_type,
         input_feature_dim=input_feature_dim,
     ).to(device)
+    
+    if args.resume:
+        print(f"✓ Resuming from checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
+        if "state_dict" in checkpoint:
+            model.load_state_dict(checkpoint["state_dict"])
+        else:
+            model.load_state_dict(checkpoint) # Support loading raw state dict too
     torch.backends.cudnn.benchmark = True
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    criterion = nn.BCEWithLogitsLoss()
+
+    if args.loss_type == "focal":
+        print("✓ Using Focal Loss (gamma=2.0)")
+        criterion = FocalLoss(gamma=2.0)
+    else:
+        print("✓ Using Standard BCE Loss")
+        criterion = nn.BCEWithLogitsLoss()
     scaler = torch.amp.GradScaler("cuda", enabled=use_mixed_precision)
 
     best_val_acc = 0.0
@@ -823,11 +993,11 @@ def main() -> None:
             use_mixed_precision,
             augment=args.augment,
         )
-        val_loss, val_acc = evaluate(model, device, val_loader, criterion)
+        val_loss, val_acc, val_song_acc = evaluate(model, device, val_loader, criterion)
         print(
             f"Epoch {epoch:03d}/{args.epochs} | "
             f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:5.2f}% | "
-            f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:5.2f}%"
+            f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:5.2f}% | Song Acc: {val_song_acc*100:5.2f}%"
         )
         if val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -857,8 +1027,8 @@ def main() -> None:
         model.load_state_dict(best_state)
         best_val_acc = max(best_val_acc, fine_tune_stats.get("val_acc", best_val_acc))
 
-    test_loss, test_acc = evaluate(model, device, test_loader, criterion)
-    print(f"\nFinal Test Loss: {test_loss:.4f} | Test Accuracy: {test_acc*100:5.2f}%")
+    test_loss, test_acc, test_song_acc = evaluate(model, device, test_loader, criterion)
+    print(f"\nFinal Test Loss: {test_loss:.4f} | Test Accuracy: {test_acc*100:5.2f}% | Song Accuracy: {test_song_acc*100:5.2f}%")
 
     metadata = {
         "trained_at": datetime.utcnow().isoformat() + "Z",

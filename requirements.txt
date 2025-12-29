@@ -8,3 +8,6 @@ torchaudio==2.6.0+cu124
 torchvision==0.21.0+cu124
 openl3>=0.4.1
 matplotlib>=3.10
+flask>=3.0.0
+flask-cors>=4.0.0
+pillow>=10.0.0
